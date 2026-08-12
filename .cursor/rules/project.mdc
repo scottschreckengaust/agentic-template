@@ -1,0 +1,6 @@
+---
+alwaysApply: true
+---
+
+- MUST work in a `git worktree`, NEVER work in `main`, ALWAYS pull in `main` to rebase
+-

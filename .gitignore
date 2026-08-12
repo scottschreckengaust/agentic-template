@@ -1,0 +1,5 @@
+# Claude Code personal (per-developer) settings — do not commit
+.claude/settings.local.json
+
+# opencode per-developer project overlay — do not commit
+.opencode/opencode.jsonc

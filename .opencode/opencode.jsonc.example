@@ -1,0 +1,14 @@
+// Per-developer opencode overlay. Gitignored — never commit.
+// Merged over .opencode/opencode.json and wins on conflicting keys.
+// Copy to .opencode/opencode.jsonc, edit, then restart opencode.
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "amazon-bedrock": {
+      "options": {
+        "region": "us-west-2",
+        "profile": "ai3"
+      }
+    }
+  }
+}
