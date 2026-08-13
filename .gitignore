@@ -3,3 +3,7 @@
 
 # opencode per-developer project overlay — do not commit
 .opencode/opencode.jsonc
+
+# Local git worktrees
+.worktrees/
+
