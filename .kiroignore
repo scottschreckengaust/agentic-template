@@ -1,0 +1,11 @@
+  # Secrets and credentials
+  .env
+  .env.*
+  !.env.example
+  *.pem
+  *.key
+  secrets/
+
+  # Per-developer settings (already gitignored, but also block agent access)
+  .claude/settings.local.json
+  .opencode/opencode.jsonc
