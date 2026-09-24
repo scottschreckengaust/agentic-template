@@ -4,6 +4,9 @@
 # opencode per-developer project overlay — do not commit
 .opencode/opencode.jsonc
 
+# Copilot CLI personal project overrides — do not commit
+.github/copilot/settings.local.json
+
 # Local git worktrees
 .worktrees/
 

@@ -1,0 +1,569 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "aws-bedrock-token-generator",
+# ]
+# ///
+"""Launch GitHub Copilot CLI against Amazon Bedrock.
+
+With no arguments, the Bedrock model id is read from Copilot's startup
+settings and the provider is derived from that id. Credentials come from
+AWS_PROFILE when it is set, otherwise from the default AWS chain. A
+successful sts get-caller-identity call is required before launch.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import urllib.parse
+from http.client import HTTPConnection, HTTPSConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+# Dots and slashes would let AWS_REGION change the request host.
+AWS_REGION_PATTERN = re.compile(r"^[a-z0-9-]+$")
+
+PROVIDERS = ("claude", "codex", "grok")
+CROSS_REGION_PREFIXES = ("global.", "us.", "eu.", "ap.", "in.")
+
+# Remove this proxy once https://github.com/github/copilot-sdk/issues/1557
+# ships a Copilot CLI that omits sampling parameters. The CLI sends
+# temperature=0 on every Anthropic Messages request. Claude Opus 4.7 and
+# later reject temperature, top_p, and top_k. Older Claude models treat
+# those fields as optional, so dropping them leaves their defaults in place.
+SAMPLING_PARAMETERS = ("temperature", "top_p", "top_k")
+MAX_PROXY_BODY_BYTES = 32 * 1024 * 1024
+_HOP_BY_HOP = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "host",
+    }
+)
+
+
+def usage() -> str:
+    return (
+        "usage: copilot-bedrock [--provider claude|codex|grok]\n"
+        "                      [--bedrock-model MODEL] [copilot args...]\n"
+        "\n"
+        "Every argument other than --provider and --bedrock-model is passed\n"
+        "to copilot, including help and --help. --launcher-help prints this\n"
+        "text. A bare -- is not forwarded; arguments after it go to copilot.\n"
+        "\n"
+        "With no --bedrock-model, MODEL is read from Copilot's startup\n"
+        "settings and the provider is derived from the model id:\n"
+        "  anthropic.* -> claude, openai.* -> codex, xai.* -> grok\n"
+        "A cross-region prefix (global., us., eu., ap., in.) is ignored.\n"
+        "\n"
+        "Settings are checked in the same order Copilot applies them:\n"
+        "  1. COPILOT_MODEL\n"
+        "  2. .github/copilot/settings.local.json\n"
+        "  3. .github/copilot/settings.json\n"
+        "  4. ~/.copilot/settings.json (or $COPILOT_HOME/settings.json)\n"
+        "The key is \"model\".\n"
+        "\n"
+        "Credentials use AWS_PROFILE when set, otherwise the default AWS chain.\n"
+        "Launch continues only after sts get-caller-identity succeeds.\n"
+        "AWS_REGION is used when set; otherwise the region comes from the\n"
+        "resolved profile or default AWS config.\n"
+        "\n"
+        "Claude traffic is sent through a proxy on 127.0.0.1 that drops\n"
+        "temperature, top_p, and top_k. Remove that proxy once\n"
+        "https://github.com/github/copilot-sdk/issues/1557 is fixed."
+    )
+
+
+def validate_region(region: str) -> str:
+    if not AWS_REGION_PATTERN.fullmatch(region):
+        sys.exit(f"Refusing AWS region {region!r}. Expected a value like us-east-1.")
+    return region
+
+
+def resolve_region() -> str:
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if region:
+        return validate_region(region)
+
+    from botocore.session import Session
+
+    profile = os.environ.get("AWS_PROFILE")
+    session = Session(profile=profile) if profile else Session()
+    discovered = session.get_config_variable("region")
+    if not discovered:
+        sys.exit("Set AWS_REGION, or set a region on the AWS profile.")
+    return validate_region(discovered)
+
+
+def is_cross_region(model: str) -> bool:
+    return model.startswith(CROSS_REGION_PREFIXES)
+
+
+def derive_provider(model: str) -> str | None:
+    """Map a Bedrock model id to claude, codex, or grok."""
+    body = model
+    for prefix in CROSS_REGION_PREFIXES:
+        if body.startswith(prefix):
+            body = body[len(prefix) :]
+            break
+    if body.startswith("anthropic."):
+        return "claude"
+    if body.startswith("openai."):
+        return "codex"
+    if body.startswith("xai."):
+        return "grok"
+    return None
+
+
+def _named_value(argv: list[str], index: int, name: str) -> tuple[str, int]:
+    """Read --name value or --name=value and return the value and next index."""
+    arg = argv[index]
+    prefix = name + "="
+    if arg.startswith(prefix):
+        value = arg[len(prefix) :]
+        if not value:
+            sys.exit(f"{name} needs a value.")
+        return value, index + 1
+    if index + 1 >= len(argv) or argv[index + 1] == "--":
+        sys.exit(f"{name} needs a value.")
+    return argv[index + 1], index + 2
+
+
+def parse_invocation(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
+    """Return a provider, a Bedrock model, and the arguments for copilot.
+
+    --provider and --bedrock-model are launcher options. Every other
+    argument is passed through, so copilot subcommands such as help are
+    not taken as the model id.
+    """
+    provider: str | None = None
+    model: str | None = None
+    copilot_args: list[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            copilot_args.extend(argv[index + 1 :])
+            break
+        if arg == "--provider" or arg.startswith("--provider="):
+            provider, index = _named_value(argv, index, "--provider")
+            if provider not in PROVIDERS:
+                sys.exit(f"Provider must be one of: {', '.join(PROVIDERS)}.")
+            continue
+        if arg == "--bedrock-model" or arg.startswith("--bedrock-model="):
+            model, index = _named_value(argv, index, "--bedrock-model")
+            continue
+        copilot_args.append(arg)
+        index += 1
+    return provider, model, copilot_args
+
+
+def smoke_test_credentials(region: str) -> None:
+    """Run sts get-caller-identity with the same credential chain Bedrock will use."""
+    from botocore.session import Session
+
+    profile = os.environ.get("AWS_PROFILE")
+    session = Session(profile=profile) if profile else Session()
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    client = session.create_client("sts", region_name=region)
+    try:
+        identity = client.get_caller_identity()
+    except (BotoCoreError, ClientError) as exc:
+        sys.exit(f"AWS credential check failed (sts get-caller-identity): {exc}")
+    arn = identity.get("Arn", "unknown")
+    source = f"profile {profile}" if profile else "default credential chain"
+    print(f"copilot-bedrock: sts get-caller-identity ok ({source}): {arn}", file=sys.stderr)
+
+
+def strip_jsonc(text: str) -> str:
+    """Remove // and /* */ comments and trailing commas outside strings."""
+    out: list[str] = []
+    i = 0
+    length = len(text)
+    in_string = False
+    escape = False
+    while i < length:
+        char = text[i]
+        if in_string:
+            out.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            i += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            i += 1
+            continue
+        if char == "/" and i + 1 < length and text[i + 1] == "/":
+            i += 2
+            while i < length and text[i] not in "\r\n":
+                i += 1
+            continue
+        if char == "/" and i + 1 < length and text[i + 1] == "*":
+            i += 2
+            while i + 1 < length and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, length)
+            continue
+        out.append(char)
+        i += 1
+
+    stripped = "".join(out)
+    cleaned: list[str] = []
+    i = 0
+    length = len(stripped)
+    in_string = False
+    escape = False
+    while i < length:
+        char = stripped[i]
+        if in_string:
+            cleaned.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            i += 1
+            continue
+        if char == '"':
+            in_string = True
+            cleaned.append(char)
+            i += 1
+            continue
+        if char == ",":
+            j = i + 1
+            while j < length and stripped[j] in " \t\r\n":
+                j += 1
+            if j < length and stripped[j] in "}]":
+                i += 1
+                continue
+        cleaned.append(char)
+        i += 1
+    return "".join(cleaned)
+
+
+def model_from_settings(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    parsed = json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
+    if not isinstance(parsed, dict):
+        return None
+    model = parsed.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    permissions = parsed.get("permissions")
+    if isinstance(permissions, dict):
+        nested = permissions.get("model")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return None
+
+
+def find_repo_root(start: Path) -> Path | None:
+    current = start.resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists() or (candidate / ".github").is_dir():
+            return candidate
+    return None
+
+
+def model_from_startup_config(start: Path | None = None) -> tuple[str | None, str | None]:
+    """Return (model id, source label) from Copilot's startup configuration."""
+    from_env = os.environ.get("COPILOT_MODEL", "").strip()
+    if from_env:
+        return from_env, "COPILOT_MODEL"
+
+    root = find_repo_root(start or Path.cwd())
+    if root is not None:
+        local = root / ".github" / "copilot" / "settings.local.json"
+        repo = root / ".github" / "copilot" / "settings.json"
+        for path in (local, repo):
+            found = model_from_settings(path)
+            if found:
+                return found, str(path)
+
+    home = os.environ.get("COPILOT_HOME")
+    user_settings = Path(home).expanduser() if home else Path.home() / ".copilot"
+    user_file = user_settings / "settings.json"
+    found = model_from_settings(user_file)
+    if found:
+        return found, str(user_file)
+    return None, None
+
+
+def strip_sampling_parameters(raw: bytes) -> bytes:
+    """Drop temperature, top_p, and top_k from a JSON object body."""
+    if not raw:
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(parsed, dict):
+        return raw
+    if not any(key in parsed for key in SAMPLING_PARAMETERS):
+        return raw
+    cleaned = {key: value for key, value in parsed.items() if key not in SAMPLING_PARAMETERS}
+    return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def anthropic_path_allowed(target: str) -> bool:
+    """Allow only a relative /anthropic/ path on the fixed Bedrock host."""
+    split = urllib.parse.urlsplit(target)
+    if split.scheme or split.netloc:
+        return False
+    path = urllib.parse.unquote(split.path)
+    if not path.startswith("/anthropic/") or path.startswith("//") or "\\" in path:
+        return False
+    return ".." not in path.split("/")
+
+
+def _connection_for(origin: urllib.parse.SplitResult) -> HTTPConnection:
+    port = origin.port or (443 if origin.scheme == "https" else 80)
+    if origin.scheme == "https":
+        return HTTPSConnection(origin.hostname or "", port, timeout=None)
+    return HTTPConnection(origin.hostname or "", port, timeout=None)
+
+
+def _proxy_handler(origin: urllib.parse.SplitResult) -> type[BaseHTTPRequestHandler]:
+    class SamplingProxyHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        close_connection = True
+
+        def log_message(self, fmt: str, *args: object) -> None:
+            return
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._forward()
+
+        def do_POST(self) -> None:  # noqa: N802
+            self._forward()
+
+        def do_PUT(self) -> None:  # noqa: N802
+            self._forward()
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            self._forward()
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._forward()
+
+        def _forward(self) -> None:
+            if self.client_address[0] not in {"127.0.0.1", "::1"}:
+                self.send_error(403)
+                return
+            if not anthropic_path_allowed(self.path):
+                self.send_error(404)
+                return
+            try:
+                body = self._read_body()
+            except ValueError:
+                self.send_error(400)
+                return
+            if body is None:
+                self.send_error(413)
+                return
+            forwarded = strip_sampling_parameters(body)
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in _HOP_BY_HOP
+            }
+            headers["Host"] = origin.hostname or ""
+            headers["Content-Length"] = str(len(forwarded))
+            connection = _connection_for(origin)
+            try:
+                connection.request(self.command, self.path, body=forwarded, headers=headers)
+                upstream = connection.getresponse()
+                status = upstream.status
+                response_headers = [
+                    (key, value)
+                    for key, value in upstream.headers.items()
+                    if key.lower() not in _HOP_BY_HOP
+                ]
+                self.send_response(status)
+                for key, value in response_headers:
+                    self.send_header(key, value)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                while True:
+                    chunk = upstream.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except OSError:
+                print(
+                    "copilot-bedrock: Bedrock proxy request failed",
+                    file=sys.stderr,
+                )
+                if not self.wfile.closed:
+                    self.send_error(502)
+                return
+            finally:
+                connection.close()
+
+        def _read_body(self) -> bytes | None:
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                return b""
+            if not raw_length.isdecimal():
+                raise ValueError(raw_length)
+            length = int(raw_length)
+            if length > MAX_PROXY_BODY_BYTES:
+                return None
+            return self.rfile.read(length)
+
+    return SamplingProxyHandler
+
+
+def start_sampling_proxy(origin: str) -> ThreadingHTTPServer:
+    """Listen on 127.0.0.1 and forward /anthropic/ to a fixed Bedrock origin."""
+    parsed = urllib.parse.urlsplit(origin)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        sys.exit(f"Refusing proxy origin {origin!r}.")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _proxy_handler(parsed))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, name="bedrock-sampling-proxy", daemon=True)
+    thread.start()
+    return server
+
+
+def run_copilot(copilot_args: list[str], proxy: ThreadingHTTPServer | None) -> None:
+    """Run copilot. A Claude proxy has to outlive this process, so stay resident."""
+    command = ["copilot", *copilot_args]
+    if proxy is None:
+        os.execvp("copilot", command)
+    try:
+        process = subprocess.Popen(command)
+    except OSError as exc:
+        proxy.shutdown()
+        proxy.server_close()
+        sys.exit(f"copilot: {exc}")
+    try:
+        code = process.wait()
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+    if code < 0:
+        code = 128 + (-code)
+    raise SystemExit(code)
+
+
+def provider_env(provider: str, model: str, region: str) -> dict[str, str]:
+    """Return Copilot CLI provider variables for a Bedrock model."""
+    cross_region = is_cross_region(model)
+    if provider == "claude":
+        host = (
+            f"https://bedrock-runtime.{region}.amazonaws.com/anthropic"
+            if cross_region
+            else f"https://bedrock-mantle.{region}.api.aws/anthropic"
+        )
+        return {
+            "COPILOT_PROVIDER_TYPE": "anthropic",
+            "COPILOT_PROVIDER_BASE_URL": host,
+            "COPILOT_MODEL": model,
+        }
+
+    host = (
+        f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
+        if cross_region
+        else f"https://bedrock-mantle.{region}.api.aws/openai/v1"
+    )
+    return {
+        "COPILOT_PROVIDER_TYPE": "openai",
+        "COPILOT_PROVIDER_WIRE_API": "responses",
+        "COPILOT_PROVIDER_BASE_URL": host,
+        "COPILOT_MODEL": model,
+    }
+
+
+def main(argv: list[str]) -> None:
+    if "--launcher-help" in argv:
+        print(usage())
+        sys.exit(0)
+
+    provider, model, copilot_args = parse_invocation(argv)
+    source = "command line"
+    if not model:
+        model, source = model_from_startup_config()
+        if not model:
+            sys.exit(
+                "No model was given and none is set in Copilot's startup configuration.\n"
+                "Pass a model id, set COPILOT_MODEL, or set \"model\" in one of:\n"
+                "  .github/copilot/settings.local.json\n"
+                "  .github/copilot/settings.json\n"
+                "  ~/.copilot/settings.json\n"
+                "When COPILOT_HOME is set, the user file is $COPILOT_HOME/settings.json."
+            )
+    if not model.strip():
+        sys.exit("MODEL must be a Bedrock model id.")
+
+    if provider is None:
+        provider = derive_provider(model)
+        if provider is None:
+            sys.exit(
+                f"Cannot derive a provider from model {model!r}.\n"
+                "Expected an anthropic., openai., or xai. model id, "
+                "or pass claude, codex, or grok."
+            )
+        print(
+            f"copilot-bedrock: derived provider {provider} from {model} ({source})",
+            file=sys.stderr,
+        )
+    elif source != "command line":
+        print(f"copilot-bedrock: using model {model} from {source}", file=sys.stderr)
+
+    region = resolve_region()
+    smoke_test_credentials(region)
+    from aws_bedrock_token_generator import provide_token
+
+    token = provide_token(region=region)
+    env = provider_env(provider, model, region)
+    env["COPILOT_PROVIDER_API_KEY"] = token
+
+    proxy = None
+    if provider == "claude":
+        # Remove once https://github.com/github/copilot-sdk/issues/1557 is fixed.
+        upstream = env["COPILOT_PROVIDER_BASE_URL"].removesuffix("/anthropic")
+        proxy = start_sampling_proxy(upstream)
+        host, port = proxy.server_address[:2]
+        env["COPILOT_PROVIDER_BASE_URL"] = f"http://{host}:{port}/anthropic"
+        print(
+            "copilot-bedrock: dropping temperature, top_p, and top_k "
+            f"on {env['COPILOT_PROVIDER_BASE_URL']} until copilot-sdk#1557 is fixed",
+            file=sys.stderr,
+        )
+
+    os.environ.pop("COPILOT_PROVIDER_WIRE_API", None)
+    os.environ.update(env)
+    run_copilot(copilot_args, proxy)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
