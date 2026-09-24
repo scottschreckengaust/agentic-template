@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Launch Copilot CLI with a Bedrock OpenAI Codex-class model.
-# Usage: copilot-codex MODEL [copilot args...]
+# Usage: copilot-codex [MODEL] [copilot args...]
+# MODEL defaults to Copilot's project or user settings.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
-  echo "usage: copilot-codex MODEL [copilot args...]" >&2
-  exit 2
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "usage: copilot-codex [MODEL] [copilot args...]"
+  echo "When MODEL is omitted, \"model\" is read from Copilot startup settings."
+  exit 0
 fi
 
 exec "$here/copilot-bedrock" codex "$@"

@@ -14,8 +14,10 @@ in-region ids use bedrock-mantle.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+from pathlib import Path
 
 PROVIDERS = ("claude", "codex", "grok")
 CROSS_REGION_PREFIXES = ("global.", "us.", "eu.", "ap.", "in.")
@@ -23,10 +25,18 @@ CROSS_REGION_PREFIXES = ("global.", "us.", "eu.", "ap.", "in.")
 
 def usage() -> str:
     return (
-        "usage: copilot-bedrock {claude|codex|grok} MODEL [copilot args...]\n"
+        "usage: copilot-bedrock {claude|codex|grok} [MODEL] [copilot args...]\n"
         "\n"
         "AWS_PROFILE must already be set. AWS_REGION is used when set;\n"
-        "otherwise the region is read from that profile."
+        "otherwise the region is read from that profile.\n"
+        "\n"
+        "When MODEL is omitted, the Bedrock model id is read from Copilot's\n"
+        "startup settings, in the same order Copilot applies them:\n"
+        "  1. COPILOT_MODEL\n"
+        "  2. .github/copilot/settings.local.json\n"
+        "  3. .github/copilot/settings.json\n"
+        "  4. ~/.copilot/settings.json (or $COPILOT_HOME/settings.json)\n"
+        "The key is \"model\"."
     )
 
 
@@ -47,6 +57,128 @@ def resolve_region() -> str:
 
 def is_cross_region(model: str) -> bool:
     return model.startswith(CROSS_REGION_PREFIXES)
+
+
+def strip_jsonc(text: str) -> str:
+    """Remove // and /* */ comments and trailing commas outside strings."""
+    out: list[str] = []
+    i = 0
+    length = len(text)
+    in_string = False
+    escape = False
+    while i < length:
+        char = text[i]
+        if in_string:
+            out.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            i += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            i += 1
+            continue
+        if char == "/" and i + 1 < length and text[i + 1] == "/":
+            i += 2
+            while i < length and text[i] not in "\r\n":
+                i += 1
+            continue
+        if char == "/" and i + 1 < length and text[i + 1] == "*":
+            i += 2
+            while i + 1 < length and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, length)
+            continue
+        out.append(char)
+        i += 1
+
+    stripped = "".join(out)
+    cleaned: list[str] = []
+    i = 0
+    length = len(stripped)
+    in_string = False
+    escape = False
+    while i < length:
+        char = stripped[i]
+        if in_string:
+            cleaned.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            i += 1
+            continue
+        if char == '"':
+            in_string = True
+            cleaned.append(char)
+            i += 1
+            continue
+        if char == ",":
+            j = i + 1
+            while j < length and stripped[j] in " \t\r\n":
+                j += 1
+            if j < length and stripped[j] in "}]":
+                i += 1
+                continue
+        cleaned.append(char)
+        i += 1
+    return "".join(cleaned)
+
+
+def model_from_settings(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    parsed = json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
+    if not isinstance(parsed, dict):
+        return None
+    model = parsed.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    permissions = parsed.get("permissions")
+    if isinstance(permissions, dict):
+        nested = permissions.get("model")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return None
+
+
+def find_repo_root(start: Path) -> Path | None:
+    current = start.resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists() or (candidate / ".github").is_dir():
+            return candidate
+    return None
+
+
+def model_from_startup_config(start: Path | None = None) -> tuple[str | None, str | None]:
+    """Return (model id, source label) from Copilot's startup configuration."""
+    from_env = os.environ.get("COPILOT_MODEL", "").strip()
+    if from_env:
+        return from_env, "COPILOT_MODEL"
+
+    root = find_repo_root(start or Path.cwd())
+    if root is not None:
+        local = root / ".github" / "copilot" / "settings.local.json"
+        repo = root / ".github" / "copilot" / "settings.json"
+        for path in (local, repo):
+            found = model_from_settings(path)
+            if found:
+                return found, str(path)
+
+    home = os.environ.get("COPILOT_HOME")
+    user_settings = Path(home).expanduser() if home else Path.home() / ".copilot"
+    user_file = user_settings / "settings.json"
+    found = model_from_settings(user_file)
+    if found:
+        return found, str(user_file)
+    return None, None
 
 
 def provider_env(provider: str, model: str, region: str) -> dict[str, str]:
@@ -78,15 +210,29 @@ def provider_env(provider: str, model: str, region: str) -> dict[str, str]:
 
 
 def main(argv: list[str]) -> None:
-    if len(argv) < 2 or argv[0] in {"-h", "--help"}:
+    if not argv or argv[0] in {"-h", "--help"}:
         print(usage())
         sys.exit(0 if argv and argv[0] in {"-h", "--help"} else 2)
 
-    provider, model, *copilot_args = argv
+    provider, *rest = argv
     if provider not in PROVIDERS:
         sys.exit(f"Unknown provider {provider!r}. Expected one of: {', '.join(PROVIDERS)}.")
-    if not model or model.startswith("-"):
-        sys.exit("MODEL is required and must be a Bedrock model id.")
+
+    if rest and not rest[0].startswith("-"):
+        model, *copilot_args = rest
+    else:
+        model, source = model_from_startup_config()
+        copilot_args = rest
+        if not model:
+            sys.exit(
+                "No model was given and none is set in Copilot's startup configuration.\n"
+                "Pass a model id, set COPILOT_MODEL, or set \"model\" in\n"
+                ".github/copilot/settings.json."
+            )
+        print(f"copilot-bedrock: using model {model} from {source}", file=sys.stderr)
+
+    if not model.strip():
+        sys.exit("MODEL must be a Bedrock model id.")
     if not os.environ.get("AWS_PROFILE"):
         sys.exit("AWS_PROFILE is not set.")
 
