@@ -57,14 +57,17 @@ _HOP_BY_HOP = frozenset(
 
 def usage() -> str:
     return (
-        "usage: copilot-bedrock [claude|codex|grok] [MODEL] [-- copilot args...]\n"
+        "usage: copilot-bedrock [--provider claude|codex|grok]\n"
+        "                      [--bedrock-model MODEL] [copilot args...]\n"
         "\n"
-        "With no arguments, MODEL is read from Copilot's startup settings and\n"
-        "the provider is derived from the model id:\n"
+        "Every argument other than --provider and --bedrock-model is passed\n"
+        "to copilot, including help and --help. --launcher-help prints this\n"
+        "text. A bare -- is not forwarded; arguments after it go to copilot.\n"
+        "\n"
+        "With no --bedrock-model, MODEL is read from Copilot's startup\n"
+        "settings and the provider is derived from the model id:\n"
         "  anthropic.* -> claude, openai.* -> codex, xai.* -> grok\n"
         "A cross-region prefix (global., us., eu., ap., in.) is ignored.\n"
-        "A bare -- is not forwarded. Arguments after it go to copilot,\n"
-        "including help and --help.\n"
         "\n"
         "Settings are checked in the same order Copilot applies them:\n"
         "  1. COPILOT_MODEL\n"
@@ -125,31 +128,47 @@ def derive_provider(model: str) -> str | None:
     return None
 
 
-def parse_invocation(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
-    """Return an explicit provider, an explicit model, and Copilot arguments.
+def _named_value(argv: list[str], index: int, name: str) -> tuple[str, int]:
+    """Read --name value or --name=value and return the value and next index."""
+    arg = argv[index]
+    prefix = name + "="
+    if arg.startswith(prefix):
+        value = arg[len(prefix) :]
+        if not value:
+            sys.exit(f"{name} needs a value.")
+        return value, index + 1
+    if index + 1 >= len(argv) or argv[index + 1] == "--":
+        sys.exit(f"{name} needs a value.")
+    return argv[index + 1], index + 2
 
-    A bare ``--`` ends launcher parsing and is not forwarded. Everything
-    after it is passed to copilot, including ``help`` and ``--help``.
+
+def parse_invocation(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
+    """Return a provider, a Bedrock model, and the arguments for copilot.
+
+    --provider and --bedrock-model are launcher options. Every other
+    argument is passed through, so copilot subcommands such as help are
+    not taken as the model id.
     """
-    if not argv:
-        return None, None, []
-    if argv[0] == "--":
-        return None, None, argv[1:]
-    first, *rest = argv
-    if first in PROVIDERS:
-        if rest[:1] == ["--"]:
-            return first, None, rest[1:]
-        if rest and not rest[0].startswith("-"):
-            model, *tail = rest
-            if tail[:1] == ["--"]:
-                return first, model, tail[1:]
-            return first, model, tail
-        return first, None, rest
-    if first.startswith("-"):
-        return None, None, argv
-    if rest[:1] == ["--"]:
-        return None, first, rest[1:]
-    return None, first, rest
+    provider: str | None = None
+    model: str | None = None
+    copilot_args: list[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            copilot_args.extend(argv[index + 1 :])
+            break
+        if arg == "--provider" or arg.startswith("--provider="):
+            provider, index = _named_value(argv, index, "--provider")
+            if provider not in PROVIDERS:
+                sys.exit(f"Provider must be one of: {', '.join(PROVIDERS)}.")
+            continue
+        if arg == "--bedrock-model" or arg.startswith("--bedrock-model="):
+            model, index = _named_value(argv, index, "--bedrock-model")
+            continue
+        copilot_args.append(arg)
+        index += 1
+    return provider, model, copilot_args
 
 
 def smoke_test_credentials(region: str) -> None:
@@ -485,7 +504,7 @@ def provider_env(provider: str, model: str, region: str) -> dict[str, str]:
 
 
 def main(argv: list[str]) -> None:
-    if argv and argv[0] in {"-h", "--help"}:
+    if "--launcher-help" in argv:
         print(usage())
         sys.exit(0)
 
