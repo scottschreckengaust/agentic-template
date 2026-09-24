@@ -7,9 +7,10 @@
 # ///
 """Launch GitHub Copilot CLI against Amazon Bedrock.
 
-Requires AWS_PROFILE in the environment. The model id selects the endpoint:
-cross-region ids (global., us., eu., ap., in.) use bedrock-runtime, and
-in-region ids use bedrock-mantle.
+With no arguments, the Bedrock model id is read from Copilot's startup
+settings and the provider is derived from that id. Credentials come from
+AWS_PROFILE when it is set, otherwise from the default AWS chain. A
+successful sts get-caller-identity call is required before launch.
 """
 
 from __future__ import annotations
@@ -25,18 +26,24 @@ CROSS_REGION_PREFIXES = ("global.", "us.", "eu.", "ap.", "in.")
 
 def usage() -> str:
     return (
-        "usage: copilot-bedrock {claude|codex|grok} [MODEL] [copilot args...]\n"
+        "usage: copilot-bedrock [claude|codex|grok] [MODEL] [copilot args...]\n"
         "\n"
-        "AWS_PROFILE must already be set. AWS_REGION is used when set;\n"
-        "otherwise the region is read from that profile.\n"
+        "With no arguments, MODEL is read from Copilot's startup settings and\n"
+        "the provider is derived from the model id:\n"
+        "  anthropic.* -> claude, openai.* -> codex, xai.* -> grok\n"
+        "A cross-region prefix (global., us., eu., ap., in.) is ignored.\n"
         "\n"
-        "When MODEL is omitted, the Bedrock model id is read from Copilot's\n"
-        "startup settings, in the same order Copilot applies them:\n"
+        "Settings are checked in the same order Copilot applies them:\n"
         "  1. COPILOT_MODEL\n"
         "  2. .github/copilot/settings.local.json\n"
         "  3. .github/copilot/settings.json\n"
         "  4. ~/.copilot/settings.json (or $COPILOT_HOME/settings.json)\n"
-        "The key is \"model\"."
+        "The key is \"model\".\n"
+        "\n"
+        "Credentials use AWS_PROFILE when set, otherwise the default AWS chain.\n"
+        "Launch continues only after sts get-caller-identity succeeds.\n"
+        "AWS_REGION is used when set; otherwise the region comes from the\n"
+        "resolved profile or default AWS config."
     )
 
 
@@ -57,6 +64,52 @@ def resolve_region() -> str:
 
 def is_cross_region(model: str) -> bool:
     return model.startswith(CROSS_REGION_PREFIXES)
+
+
+def derive_provider(model: str) -> str | None:
+    """Map a Bedrock model id to claude, codex, or grok."""
+    body = model
+    for prefix in CROSS_REGION_PREFIXES:
+        if body.startswith(prefix):
+            body = body[len(prefix) :]
+            break
+    if body.startswith("anthropic."):
+        return "claude"
+    if body.startswith("openai."):
+        return "codex"
+    if body.startswith("xai."):
+        return "grok"
+    return None
+
+
+def parse_invocation(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
+    """Return an explicit provider, an explicit model, and Copilot arguments."""
+    if not argv:
+        return None, None, []
+    first, *rest = argv
+    if first in PROVIDERS:
+        if rest and not rest[0].startswith("-"):
+            return first, rest[0], rest[1:]
+        return first, None, rest
+    if first.startswith("-"):
+        return None, None, argv
+    return None, first, rest
+
+
+def smoke_test_credentials(region: str) -> None:
+    """Run sts get-caller-identity with the same credential chain Bedrock will use."""
+    from botocore.session import Session
+
+    profile = os.environ.get("AWS_PROFILE")
+    session = Session(profile=profile) if profile else Session()
+    client = session.create_client("sts", region_name=region)
+    try:
+        identity = client.get_caller_identity()
+    except Exception as exc:
+        sys.exit(f"AWS credential check failed (sts get-caller-identity): {exc}")
+    arn = identity.get("Arn", "unknown")
+    source = f"profile {profile}" if profile else "default credential chain"
+    print(f"copilot-bedrock: sts get-caller-identity ok ({source}): {arn}", file=sys.stderr)
 
 
 def strip_jsonc(text: str) -> str:
@@ -210,33 +263,40 @@ def provider_env(provider: str, model: str, region: str) -> dict[str, str]:
 
 
 def main(argv: list[str]) -> None:
-    if not argv or argv[0] in {"-h", "--help"}:
+    if argv and argv[0] in {"-h", "--help"}:
         print(usage())
-        sys.exit(0 if argv and argv[0] in {"-h", "--help"} else 2)
+        sys.exit(0)
 
-    provider, *rest = argv
-    if provider not in PROVIDERS:
-        sys.exit(f"Unknown provider {provider!r}. Expected one of: {', '.join(PROVIDERS)}.")
-
-    if rest and not rest[0].startswith("-"):
-        model, *copilot_args = rest
-    else:
+    provider, model, copilot_args = parse_invocation(argv)
+    source = "command line"
+    if not model:
         model, source = model_from_startup_config()
-        copilot_args = rest
         if not model:
             sys.exit(
                 "No model was given and none is set in Copilot's startup configuration.\n"
                 "Pass a model id, set COPILOT_MODEL, or set \"model\" in\n"
                 ".github/copilot/settings.json."
             )
-        print(f"copilot-bedrock: using model {model} from {source}", file=sys.stderr)
-
     if not model.strip():
         sys.exit("MODEL must be a Bedrock model id.")
-    if not os.environ.get("AWS_PROFILE"):
-        sys.exit("AWS_PROFILE is not set.")
+
+    if provider is None:
+        provider = derive_provider(model)
+        if provider is None:
+            sys.exit(
+                f"Cannot derive a provider from model {model!r}.\n"
+                "Expected an anthropic., openai., or xai. model id, "
+                "or pass claude, codex, or grok."
+            )
+        print(
+            f"copilot-bedrock: derived provider {provider} from {model} ({source})",
+            file=sys.stderr,
+        )
+    elif source != "command line":
+        print(f"copilot-bedrock: using model {model} from {source}", file=sys.stderr)
 
     region = resolve_region()
+    smoke_test_credentials(region)
     from aws_bedrock_token_generator import provide_token
 
     token = provide_token(region=region)
