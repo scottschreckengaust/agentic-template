@@ -274,8 +274,11 @@ def main(argv: list[str]) -> None:
         if not model:
             sys.exit(
                 "No model was given and none is set in Copilot's startup configuration.\n"
-                "Pass a model id, set COPILOT_MODEL, or set \"model\" in\n"
-                ".github/copilot/settings.json."
+                "Pass a model id, set COPILOT_MODEL, or set \"model\" in one of:\n"
+                "  .github/copilot/settings.local.json\n"
+                "  .github/copilot/settings.json\n"
+                "  ~/.copilot/settings.json\n"
+                "When COPILOT_HOME is set, the user file is $COPILOT_HOME/settings.json."
             )
     if not model.strip():
         sys.exit("MODEL must be a Bedrock model id.")
