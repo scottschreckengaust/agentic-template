@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Launch Copilot CLI with a Bedrock Grok model.
+# Usage: copilot-grok MODEL [copilot args...]
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
+  echo "usage: copilot-grok MODEL [copilot args...]" >&2
+  exit 2
+fi
+
+exec "$here/copilot-bedrock" grok "$@"

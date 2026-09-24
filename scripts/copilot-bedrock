@@ -1,0 +1,106 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "aws-bedrock-token-generator",
+# ]
+# ///
+"""Launch GitHub Copilot CLI against Amazon Bedrock.
+
+Requires AWS_PROFILE in the environment. The model id selects the endpoint:
+cross-region ids (global., us., eu., ap., in.) use bedrock-runtime, and
+in-region ids use bedrock-mantle.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+PROVIDERS = ("claude", "codex", "grok")
+CROSS_REGION_PREFIXES = ("global.", "us.", "eu.", "ap.", "in.")
+
+
+def usage() -> str:
+    return (
+        "usage: copilot-bedrock {claude|codex|grok} MODEL [copilot args...]\n"
+        "\n"
+        "AWS_PROFILE must already be set. AWS_REGION is used when set;\n"
+        "otherwise the region is read from that profile."
+    )
+
+
+def resolve_region() -> str:
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if region:
+        return region
+
+    from botocore.session import Session
+
+    profile = os.environ.get("AWS_PROFILE")
+    session = Session(profile=profile) if profile else Session()
+    discovered = session.get_config_variable("region")
+    if not discovered:
+        sys.exit("Set AWS_REGION, or set a region on the AWS profile.")
+    return discovered
+
+
+def is_cross_region(model: str) -> bool:
+    return model.startswith(CROSS_REGION_PREFIXES)
+
+
+def provider_env(provider: str, model: str, region: str) -> dict[str, str]:
+    """Return Copilot CLI provider variables for a Bedrock model."""
+    cross_region = is_cross_region(model)
+    if provider == "claude":
+        host = (
+            f"https://bedrock-runtime.{region}.amazonaws.com/anthropic"
+            if cross_region
+            else f"https://bedrock-mantle.{region}.api.aws/anthropic"
+        )
+        return {
+            "COPILOT_PROVIDER_TYPE": "anthropic",
+            "COPILOT_PROVIDER_BASE_URL": host,
+            "COPILOT_MODEL": model,
+        }
+
+    host = (
+        f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
+        if cross_region
+        else f"https://bedrock-mantle.{region}.api.aws/openai/v1"
+    )
+    return {
+        "COPILOT_PROVIDER_TYPE": "openai",
+        "COPILOT_PROVIDER_WIRE_API": "responses",
+        "COPILOT_PROVIDER_BASE_URL": host,
+        "COPILOT_MODEL": model,
+    }
+
+
+def main(argv: list[str]) -> None:
+    if len(argv) < 2 or argv[0] in {"-h", "--help"}:
+        print(usage())
+        sys.exit(0 if argv and argv[0] in {"-h", "--help"} else 2)
+
+    provider, model, *copilot_args = argv
+    if provider not in PROVIDERS:
+        sys.exit(f"Unknown provider {provider!r}. Expected one of: {', '.join(PROVIDERS)}.")
+    if not model or model.startswith("-"):
+        sys.exit("MODEL is required and must be a Bedrock model id.")
+    if not os.environ.get("AWS_PROFILE"):
+        sys.exit("AWS_PROFILE is not set.")
+
+    region = resolve_region()
+    from aws_bedrock_token_generator import provide_token
+
+    token = provide_token(region=region)
+    env = provider_env(provider, model, region)
+    env["COPILOT_PROVIDER_API_KEY"] = token
+
+    os.environ.pop("COPILOT_PROVIDER_WIRE_API", None)
+    os.environ.update(env)
+    os.execvp("copilot", ["copilot", *copilot_args])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
