@@ -57,12 +57,14 @@ _HOP_BY_HOP = frozenset(
 
 def usage() -> str:
     return (
-        "usage: copilot-bedrock [claude|codex|grok] [MODEL] [copilot args...]\n"
+        "usage: copilot-bedrock [claude|codex|grok] [MODEL] [-- copilot args...]\n"
         "\n"
         "With no arguments, MODEL is read from Copilot's startup settings and\n"
         "the provider is derived from the model id:\n"
         "  anthropic.* -> claude, openai.* -> codex, xai.* -> grok\n"
         "A cross-region prefix (global., us., eu., ap., in.) is ignored.\n"
+        "A bare -- is not forwarded. Arguments after it go to copilot,\n"
+        "including help and --help.\n"
         "\n"
         "Settings are checked in the same order Copilot applies them:\n"
         "  1. COPILOT_MODEL\n"
@@ -124,16 +126,29 @@ def derive_provider(model: str) -> str | None:
 
 
 def parse_invocation(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
-    """Return an explicit provider, an explicit model, and Copilot arguments."""
+    """Return an explicit provider, an explicit model, and Copilot arguments.
+
+    A bare ``--`` ends launcher parsing and is not forwarded. Everything
+    after it is passed to copilot, including ``help`` and ``--help``.
+    """
     if not argv:
         return None, None, []
+    if argv[0] == "--":
+        return None, None, argv[1:]
     first, *rest = argv
     if first in PROVIDERS:
+        if rest[:1] == ["--"]:
+            return first, None, rest[1:]
         if rest and not rest[0].startswith("-"):
-            return first, rest[0], rest[1:]
+            model, *tail = rest
+            if tail[:1] == ["--"]:
+                return first, model, tail[1:]
+            return first, model, tail
         return first, None, rest
     if first.startswith("-"):
         return None, None, argv
+    if rest[:1] == ["--"]:
+        return None, first, rest[1:]
     return None, first, rest
 
 

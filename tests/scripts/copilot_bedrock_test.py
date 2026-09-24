@@ -15,6 +15,23 @@ SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "copilot-bedrock"
 launcher = SourceFileLoader("copilot_bedrock", str(SCRIPT)).load_module()
 
 
+class ParseInvocationTest(unittest.TestCase):
+    def test_bare_double_dash_passes_help_to_copilot(self) -> None:
+        self.assertEqual(launcher.parse_invocation(["--", "help"]), (None, None, ["help"]))
+
+    def test_double_dash_can_follow_a_model(self) -> None:
+        self.assertEqual(
+            launcher.parse_invocation(["claude", "global.anthropic.claude-opus-5-5", "--", "--help"]),
+            ("claude", "global.anthropic.claude-opus-5-5", ["--help"]),
+        )
+
+    def test_copilot_flags_stay_intact_without_a_separator(self) -> None:
+        self.assertEqual(
+            launcher.parse_invocation(["--log-level", "debug"]),
+            (None, None, ["--log-level", "debug"]),
+        )
+
+
 class StripSamplingParametersTest(unittest.TestCase):
     def test_drops_sampling_fields_and_keeps_the_model(self) -> None:
         raw = json.dumps(
