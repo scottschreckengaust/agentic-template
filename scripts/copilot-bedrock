@@ -18,7 +18,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
+import threading
+import urllib.parse
+from http.client import HTTPConnection, HTTPSConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # Dots and slashes would let AWS_REGION change the request host.
@@ -26,6 +31,28 @@ AWS_REGION_PATTERN = re.compile(r"^[a-z0-9-]+$")
 
 PROVIDERS = ("claude", "codex", "grok")
 CROSS_REGION_PREFIXES = ("global.", "us.", "eu.", "ap.", "in.")
+
+# Remove this proxy once https://github.com/github/copilot-sdk/issues/1557
+# ships a Copilot CLI that omits sampling parameters. The CLI sends
+# temperature=0 on every Anthropic Messages request. Claude Opus 4.7 and
+# later reject temperature, top_p, and top_k. Older Claude models treat
+# those fields as optional, so dropping them leaves their defaults in place.
+SAMPLING_PARAMETERS = ("temperature", "top_p", "top_k")
+MAX_PROXY_BODY_BYTES = 32 * 1024 * 1024
+_HOP_BY_HOP = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "host",
+    }
+)
 
 
 def usage() -> str:
@@ -47,7 +74,11 @@ def usage() -> str:
         "Credentials use AWS_PROFILE when set, otherwise the default AWS chain.\n"
         "Launch continues only after sts get-caller-identity succeeds.\n"
         "AWS_REGION is used when set; otherwise the region comes from the\n"
-        "resolved profile or default AWS config."
+        "resolved profile or default AWS config.\n"
+        "\n"
+        "Claude traffic is sent through a proxy on 127.0.0.1 that drops\n"
+        "temperature, top_p, and top_k. Remove that proxy once\n"
+        "https://github.com/github/copilot-sdk/issues/1557 is fixed."
     )
 
 
@@ -246,6 +277,170 @@ def model_from_startup_config(start: Path | None = None) -> tuple[str | None, st
     return None, None
 
 
+def strip_sampling_parameters(raw: bytes) -> bytes:
+    """Drop temperature, top_p, and top_k from a JSON object body."""
+    if not raw:
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(parsed, dict):
+        return raw
+    if not any(key in parsed for key in SAMPLING_PARAMETERS):
+        return raw
+    cleaned = {key: value for key, value in parsed.items() if key not in SAMPLING_PARAMETERS}
+    return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def anthropic_path_allowed(target: str) -> bool:
+    """Allow only a relative /anthropic/ path on the fixed Bedrock host."""
+    split = urllib.parse.urlsplit(target)
+    if split.scheme or split.netloc:
+        return False
+    path = urllib.parse.unquote(split.path)
+    if not path.startswith("/anthropic/") or path.startswith("//") or "\\" in path:
+        return False
+    return ".." not in path.split("/")
+
+
+def _connection_for(origin: urllib.parse.SplitResult) -> HTTPConnection:
+    port = origin.port or (443 if origin.scheme == "https" else 80)
+    if origin.scheme == "https":
+        return HTTPSConnection(origin.hostname or "", port, timeout=None)
+    return HTTPConnection(origin.hostname or "", port, timeout=None)
+
+
+def _proxy_handler(origin: urllib.parse.SplitResult) -> type[BaseHTTPRequestHandler]:
+    class SamplingProxyHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        close_connection = True
+
+        def log_message(self, fmt: str, *args: object) -> None:
+            return
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._forward()
+
+        def do_POST(self) -> None:  # noqa: N802
+            self._forward()
+
+        def do_PUT(self) -> None:  # noqa: N802
+            self._forward()
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            self._forward()
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._forward()
+
+        def _forward(self) -> None:
+            if self.client_address[0] not in {"127.0.0.1", "::1"}:
+                self.send_error(403)
+                return
+            if not anthropic_path_allowed(self.path):
+                self.send_error(404)
+                return
+            try:
+                body = self._read_body()
+            except ValueError:
+                self.send_error(400)
+                return
+            if body is None:
+                self.send_error(413)
+                return
+            forwarded = strip_sampling_parameters(body)
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in _HOP_BY_HOP
+            }
+            headers["Host"] = origin.hostname or ""
+            headers["Content-Length"] = str(len(forwarded))
+            connection = _connection_for(origin)
+            try:
+                connection.request(self.command, self.path, body=forwarded, headers=headers)
+                upstream = connection.getresponse()
+                status = upstream.status
+                response_headers = [
+                    (key, value)
+                    for key, value in upstream.headers.items()
+                    if key.lower() not in _HOP_BY_HOP
+                ]
+                self.send_response(status)
+                for key, value in response_headers:
+                    self.send_header(key, value)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                while True:
+                    chunk = upstream.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except OSError:
+                print(
+                    "copilot-bedrock: Bedrock proxy request failed",
+                    file=sys.stderr,
+                )
+                if not self.wfile.closed:
+                    self.send_error(502)
+                return
+            finally:
+                connection.close()
+
+        def _read_body(self) -> bytes | None:
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                return b""
+            if not raw_length.isdecimal():
+                raise ValueError(raw_length)
+            length = int(raw_length)
+            if length > MAX_PROXY_BODY_BYTES:
+                return None
+            return self.rfile.read(length)
+
+    return SamplingProxyHandler
+
+
+def start_sampling_proxy(origin: str) -> ThreadingHTTPServer:
+    """Listen on 127.0.0.1 and forward /anthropic/ to a fixed Bedrock origin."""
+    parsed = urllib.parse.urlsplit(origin)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        sys.exit(f"Refusing proxy origin {origin!r}.")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _proxy_handler(parsed))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, name="bedrock-sampling-proxy", daemon=True)
+    thread.start()
+    return server
+
+
+def run_copilot(copilot_args: list[str], proxy: ThreadingHTTPServer | None) -> None:
+    """Run copilot. A Claude proxy has to outlive this process, so stay resident."""
+    command = ["copilot", *copilot_args]
+    if proxy is None:
+        os.execvp("copilot", command)
+    try:
+        process = subprocess.Popen(command)
+    except OSError as exc:
+        proxy.shutdown()
+        proxy.server_close()
+        sys.exit(f"copilot: {exc}")
+    try:
+        code = process.wait()
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+    if code < 0:
+        code = 128 + (-code)
+    raise SystemExit(code)
+
+
 def provider_env(provider: str, model: str, region: str) -> dict[str, str]:
     """Return Copilot CLI provider variables for a Bedrock model."""
     cross_region = is_cross_region(model)
@@ -318,9 +513,22 @@ def main(argv: list[str]) -> None:
     env = provider_env(provider, model, region)
     env["COPILOT_PROVIDER_API_KEY"] = token
 
+    proxy = None
+    if provider == "claude":
+        # Remove once https://github.com/github/copilot-sdk/issues/1557 is fixed.
+        upstream = env["COPILOT_PROVIDER_BASE_URL"].removesuffix("/anthropic")
+        proxy = start_sampling_proxy(upstream)
+        host, port = proxy.server_address[:2]
+        env["COPILOT_PROVIDER_BASE_URL"] = f"http://{host}:{port}/anthropic"
+        print(
+            "copilot-bedrock: dropping temperature, top_p, and top_k "
+            f"on {env['COPILOT_PROVIDER_BASE_URL']} until copilot-sdk#1557 is fixed",
+            file=sys.stderr,
+        )
+
     os.environ.pop("COPILOT_PROVIDER_WIRE_API", None)
     os.environ.update(env)
-    os.execvp("copilot", ["copilot", *copilot_args])
+    run_copilot(copilot_args, proxy)
 
 
 if __name__ == "__main__":
